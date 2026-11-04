@@ -90,34 +90,41 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def show_force_panel(message, context, uid):
     channels = list(force_channels.find().sort("_id", 1))
-    if not channels:
+    missing = []
+    for ch in channels:
+        if not await user_is_member(context, ch["chat_id"], uid):
+            missing.append(ch)
+    if not missing:
         await show_targets(message, context, uid)
         return
-    rows = []
-    for ch in channels:
-        rows.append([InlineKeyboardButton(
-            f"📢 JOIN {nice_title(ch)}", url=ch["join_url"]
-        )])
+    rows = [[InlineKeyboardButton(f"📢 JOIN {nice_title(ch)}", url=ch["join_url"])]
+            for ch in missing]
     rows.append([InlineKeyboardButton("✅ VERIFY ALL", callback_data="verify_force")])
     await message.reply_text(
-        "🔒 Target Channel ka access paane ke liye pehle neeche diye gaye sabhi Force Subscribe Channels join karein.",
+        "🔒 Kripya pehle neeche diye gaye sabhi channels join karein.",
         reply_markup=InlineKeyboardMarkup(rows)
     )
 
 async def show_targets(message, context, uid):
     targets = list(target_channels.find().sort("_id", 1))
-    if not targets:
-        await message.reply_text("Abhi koi Target Channel set nahi hai.")
-        return
-    rows = []
+    missing = []
     for ch in targets:
-        rows.append([InlineKeyboardButton(
-            f"🎯 GET {nice_title(ch)} INVITE", callback_data=f"get_target:{ch['_id']}"
-        )])
-    await message.reply_text(
-        "✅ Force Subscribe complete!\nNeeche diye gaye Target Channel button par click karein.",
+        if not await user_is_member(context, ch["chat_id"], uid):
+            missing.append(ch)
+    if not missing:
+        await message.reply_text("✅ Aap sabhi channels mein pehle se joined hain.")
+        return
+    rows = [[InlineKeyboardButton(
+        f"🎯 GET {nice_title(ch)} INVITE", callback_data=f"get_target:{ch['_id']}"
+    )] for ch in missing]
+    sent = await message.reply_text(
+        "✅ Force Subscribe complete!\nNeeche sirf un channels ke buttons hain jinhe aapne abhi join nahi kiya.",
         reply_markup=InlineKeyboardMarkup(rows)
     )
+    users.update_one({"user_id": uid}, {"$set": {
+        "target_panel_chat_id": sent.chat_id,
+        "target_panel_message_id": sent.message_id
+    }}, upsert=True)
 
 async def user_is_member(context, chat_id, uid):
     try:
@@ -155,7 +162,6 @@ async def get_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_banned(uid):
         await q.answer("Aapka access band kar diya gaya hai.", show_alert=True)
         return
-    # Re-check force membership before issuing any target invite.
     for ch in force_channels.find():
         if not await user_is_member(context, ch["chat_id"], uid):
             await q.answer("Pehle sabhi Force Subscribe Channels join karein.", show_alert=True)
@@ -167,11 +173,17 @@ async def get_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
     target_id = q.data.split(":", 1)[1]
     from bson import ObjectId
-    target = target_channels.find_one({"_id": ObjectId(target_id)})
+    try:
+        target = target_channels.find_one({"_id": ObjectId(target_id)})
+    except Exception:
+        target = None
     if not target:
         await q.answer("Target Channel nahi mila.", show_alert=True)
         return
-    # Prevent duplicate active invites for the same user and target.
+    if await user_is_member(context, target["chat_id"], uid):
+        await q.answer("Aap is channel mein pehle se joined hain.", show_alert=True)
+        await refresh_target_panel(context, uid)
+        return
     existing = invite_logs.find_one({
         "user_id": uid, "target_chat_id": target["chat_id"], "status": "pending"
     })
@@ -182,15 +194,17 @@ async def get_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except TelegramError:
             pass
+        try:
+            await context.bot.delete_message(existing["message_chat_id"], existing["message_id"])
+        except TelegramError:
+            pass
         invite_logs.update_one({"_id": existing["_id"]}, {"$set": {"status": "replaced"}})
     try:
         invite = await context.bot.create_chat_invite_link(
-            chat_id=target["chat_id"],
-            member_limit=1,
-            name=f"user-{uid}"
+            chat_id=target["chat_id"], member_limit=1, name=f"user-{uid}"
         )
         sent = await q.message.reply_text(
-            f"🎯 {nice_title(target)} join karne ke liye neeche diye gaye button par click karein.",
+            f"🎯 {nice_title(target)} join karne ke liye neeche button par click karein.",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("🚀 JOIN TARGET CHANNEL", url=invite.invite_link)
             ]])
@@ -201,52 +215,83 @@ async def get_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "message_id": sent.message_id, "status": "pending",
             "created_at": datetime.now(timezone.utc)
         })
-        await q.answer("Aapka personal One-Time Invite link generate ho gaya hai.")
+        await q.answer("Aapka One-Time Invite Link ready hai.")
     except TelegramError as exc:
         log.exception("Could not create invite: %s", exc)
-        await q.answer("Invite link generate nahi ho saka. Bot ko Target Channel mein Admin banayein aur Invite Users permission dein.",
-                       show_alert=True)
+        await q.answer("Invite link nahi ban saka. Bot ko Target Channel mein Admin banayein aur Invite Users permission dein.", show_alert=True)
+
+async def refresh_target_panel(context: ContextTypes.DEFAULT_TYPE, uid: int):
+    """Keep only not-yet-joined target buttons; remove the panel when all are joined."""
+    user_doc = users.find_one({"user_id": uid}) or {}
+    chat_id = user_doc.get("target_panel_chat_id")
+    message_id = user_doc.get("target_panel_message_id")
+    missing = []
+    for ch in target_channels.find().sort("_id", 1):
+        if not await user_is_member(context, ch["chat_id"], uid):
+            missing.append(ch)
+    if not missing:
+        if chat_id and message_id:
+            try:
+                await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+            except TelegramError:
+                pass
+        users.update_one({"user_id": uid}, {"$unset": {
+            "target_panel_chat_id": "", "target_panel_message_id": ""
+        }})
+        try:
+            await context.bot.send_message(uid, "✅ Aap sabhi channels mein pehle se joined hain.")
+        except TelegramError:
+            pass
+        return
+    if chat_id and message_id:
+        rows = [[InlineKeyboardButton(
+            f"🎯 GET {nice_title(ch)} INVITE", callback_data=f"get_target:{ch['_id']}"
+        )] for ch in missing]
+        try:
+            await context.bot.edit_message_reply_markup(
+                chat_id=chat_id, message_id=message_id,
+                reply_markup=InlineKeyboardMarkup(rows)
+            )
+        except TelegramError:
+            pass
 
 async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     event = update.chat_member
     if not event:
         return
-    old = event.old_chat_member
-    new = event.new_chat_member
+    old, new = event.old_chat_member, event.new_chat_member
     joined = new.status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR,
                             ChatMemberStatus.OWNER) and old.status in (
                                 ChatMemberStatus.LEFT, ChatMemberStatus.BANNED
                             )
-    if not joined:
+    if not joined or new.user.is_bot:
         return
     uid = new.user.id
+    # If the user joined through this bot's personal one-time link, delete that link message
+    # and revoke the link immediately after successful join.
     invite = event.invite_link.invite_link if event.invite_link else None
-    if invite:
-        log_doc = invite_logs.find_one({
-            "invite_link": invite, "user_id": uid, "status": "pending"
-        })
-        if log_doc:
-            try:
-                await context.bot.delete_message(
-                    chat_id=log_doc["message_chat_id"],
-                    message_id=log_doc["message_id"]
-                )
-            except TelegramError:
-                pass
-            try:
-                await context.bot.revoke_chat_invite_link(
-                    chat_id=event.chat.id, invite_link=invite
-                )
-            except TelegramError:
-                pass
-            invite_logs.update_one(
-                {"_id": log_doc["_id"]},
-                {"$set": {"status": "used", "joined_at": datetime.now(timezone.utc)}}
+    log_doc = invite_logs.find_one({
+        "user_id": uid, "target_chat_id": event.chat.id, "status": "pending"
+    })
+    if log_doc and (not invite or log_doc.get("invite_link") == invite):
+        try:
+            await context.bot.delete_message(
+                chat_id=log_doc["message_chat_id"], message_id=log_doc["message_id"]
             )
-            try:
-                await context.bot.send_message(uid, "✅ Aap successfully Target Channel join kar chuke hain.")
-            except TelegramError:
-                pass
+        except TelegramError:
+            pass
+        try:
+            await context.bot.revoke_chat_invite_link(
+                chat_id=event.chat.id, invite_link=log_doc["invite_link"]
+            )
+        except TelegramError:
+            pass
+        invite_logs.update_one({"_id": log_doc["_id"]}, {"$set": {
+            "status": "used", "joined_at": datetime.now(timezone.utc)
+        }})
+    # Update the user's target list whether they used the invite or joined another way.
+    if target_channels.find_one({"chat_id": event.chat.id}):
+        await refresh_target_panel(context, uid)
 
 async def panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
