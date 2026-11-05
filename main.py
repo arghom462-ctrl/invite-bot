@@ -1,5 +1,6 @@
 import os
 import logging
+import asyncio
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
@@ -74,7 +75,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users.update_one(
         {"user_id": uid},
         {"$set": {"user_id": uid, "username": update.effective_user.username,
-                  "first_seen": datetime.now(timezone.utc)}},
+                  "first_name": update.effective_user.first_name,
+                  "last_name": update.effective_user.last_name,
+                  "last_seen": datetime.now(timezone.utc)},
+         "$setOnInsert": {"first_seen": datetime.now(timezone.utc)}},
         upsert=True
     )
     if is_banned(uid):
@@ -86,14 +90,63 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=owner_keyboard()
         )
         return
+    user_doc = users.find_one({"user_id": uid}) or {}
+    if not user_doc.get("human_verified"):
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(
+            "🤖 I am not a robot", callback_data="human_verify"
+        )]])
+        await update.effective_message.reply_text(
+            "Pehle confirm karein ki aap robot nahi hain.", reply_markup=keyboard
+        )
+        return
     await show_force_panel(update.effective_message, context, uid)
+
+async def human_verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    user = q.from_user
+    uid = user.id
+    if is_banned(uid):
+        await q.answer("Aapko is bot ka use karne ki permission nahi hai.", show_alert=True)
+        return
+    doc = users.find_one({"user_id": uid}) or {}
+    if doc.get("human_verified"):
+        await q.answer("Aap pehle se verify ho chuke hain.")
+        try:
+            await q.message.delete()
+        except TelegramError:
+            pass
+        await show_force_panel(q.message, context, uid)
+        return
+    users.update_one({"user_id": uid}, {"$set": {
+        "human_verified": True,
+        "verified_at": datetime.now(timezone.utc),
+        "first_name": user.first_name,
+        "last_name": user.last_name,
+        "username": user.username
+    }}, upsert=True)
+    await q.answer("Verification successful!")
+    display_name = " ".join(x for x in [user.first_name, user.last_name] if x) or "Unknown"
+    username = f"@{user.username}" if user.username else "Not set"
+    notice = (
+        "New User Verified ✅\n\n"
+        f"Name: {display_name}\n"
+        f"Username: {username}\n"
+        f"User ID: {uid}\n"
+        "Status: Verified"
+    )
+    try:
+        await context.bot.send_message(chat_id=OWNER_ID, text=notice)
+    except TelegramError as exc:
+        log.warning("Could not notify owner about verified user %s: %s", uid, exc)
+    try:
+        await q.message.delete()
+    except TelegramError:
+        pass
+    await show_force_panel(q.message, context, uid)
 
 async def show_force_panel(message, context, uid):
     channels = list(force_channels.find().sort("_id", 1))
-    missing = []
-    for ch in channels:
-        if not await user_is_member(context, ch["chat_id"], uid):
-            missing.append(ch)
+    missing = await find_missing_channels(context, channels, uid)
     if not missing:
         await show_targets(message, context, uid)
         return
@@ -107,10 +160,7 @@ async def show_force_panel(message, context, uid):
 
 async def show_targets(message, context, uid):
     targets = list(target_channels.find().sort("_id", 1))
-    missing = []
-    for ch in targets:
-        if not await user_is_member(context, ch["chat_id"], uid):
-            missing.append(ch)
+    missing = await find_missing_channels(context, targets, uid)
     if not missing:
         await message.reply_text("✅ Aap sabhi channels mein pehle se joined hain.")
         return
@@ -135,17 +185,27 @@ async def user_is_member(context, chat_id, uid):
         log.warning("Membership check failed for %s / %s: %s", chat_id, uid, exc)
         return False
 
+
+async def find_missing_channels(context, channels, uid):
+    """Check channel membership concurrently to reduce response time."""
+    if not channels:
+        return []
+    results = await asyncio.gather(*(
+        user_is_member(context, ch["chat_id"], uid) for ch in channels
+    ))
+    return [ch for ch, joined in zip(channels, results) if not joined]
+
 async def verify_force(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     uid = q.from_user.id
     if is_banned(uid):
         await q.edit_message_text("Aapko is bot ka use karne ki permission nahi hai.")
         return
+    if not is_owner(uid) and not (users.find_one({"user_id": uid}) or {}).get("human_verified"):
+        await q.answer("Pehle human verification complete karein.", show_alert=True)
+        return
     channels = list(force_channels.find())
-    missing = []
-    for ch in channels:
-        if not await user_is_member(context, ch["chat_id"], uid):
-            missing.append(ch)
+    missing = await find_missing_channels(context, channels, uid)
     if missing:
         await q.answer("Aapne abhi sabhi Force Subscribe Channels join nahi kiye hain.", show_alert=True)
         return
@@ -162,15 +222,18 @@ async def get_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_banned(uid):
         await q.answer("Aapka access band kar diya gaya hai.", show_alert=True)
         return
-    for ch in force_channels.find():
-        if not await user_is_member(context, ch["chat_id"], uid):
-            await q.answer("Pehle sabhi Force Subscribe Channels join karein.", show_alert=True)
-            try:
-                await q.message.delete()
-            except TelegramError:
-                pass
-            await show_force_panel(q.message, context, uid)
-            return
+    if not is_owner(uid) and not (users.find_one({"user_id": uid}) or {}).get("human_verified"):
+        await q.answer("Pehle human verification complete karein.", show_alert=True)
+        return
+    force_missing = await find_missing_channels(context, list(force_channels.find()), uid)
+    if force_missing:
+        await q.answer("Pehle sabhi Force Subscribe Channels join karein.", show_alert=True)
+        try:
+            await q.message.delete()
+        except TelegramError:
+            pass
+        await show_force_panel(q.message, context, uid)
+        return
     target_id = q.data.split(":", 1)[1]
     from bson import ObjectId
     try:
@@ -225,10 +288,9 @@ async def refresh_target_panel(context: ContextTypes.DEFAULT_TYPE, uid: int):
     user_doc = users.find_one({"user_id": uid}) or {}
     chat_id = user_doc.get("target_panel_chat_id")
     message_id = user_doc.get("target_panel_message_id")
-    missing = []
-    for ch in target_channels.find().sort("_id", 1):
-        if not await user_is_member(context, ch["chat_id"], uid):
-            missing.append(ch)
+    missing = await find_missing_channels(
+        context, list(target_channels.find().sort("_id", 1)), uid
+    )
     if not missing:
         if chat_id and message_id:
             try:
@@ -297,6 +359,9 @@ async def panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     uid = q.from_user.id
     data = q.data
+    if data == "human_verify":
+        await human_verify(update, context)
+        return
     if data == "verify_force":
         await verify_force(update, context)
         return
@@ -431,6 +496,7 @@ def main():
         Application.builder()
         .token(BOT_TOKEN)
         .post_init(post_init)
+        .concurrent_updates(8)
         .build()
     )
     app.add_handler(CommandHandler("start", start))
