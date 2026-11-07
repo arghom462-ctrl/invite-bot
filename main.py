@@ -15,6 +15,42 @@ from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, MessageHandler,
     ChatMemberHandler, ContextTypes, filters
 )
+from telegram.ext import _updater as ptb_updater_module
+from tornado.web import RequestHandler
+
+class HealthHandler(RequestHandler):
+    """Simple public health endpoint for Render/UptimeRobot."""
+
+    def get(self):
+        self.set_header("Content-Type", "text/plain; charset=UTF-8")
+        self.set_status(200)
+        self.finish("OK")
+
+    def head(self):
+        self.set_status(200)
+        self.finish()
+
+
+def install_health_endpoint():
+    """
+    Add / and /health routes to the same Tornado server used by PTB's webhook.
+    The Telegram webhook URL and its secret path remain unchanged.
+    """
+    original_webhook_app = ptb_updater_module.WebhookAppClass
+
+    def webhook_app_with_health(*args, **kwargs):
+        tornado_app = original_webhook_app(*args, **kwargs)
+        tornado_app.add_handlers(
+            r".*$",
+            [
+                (r"/", HealthHandler),
+                (r"/health/?", HealthHandler),
+            ],
+        )
+        return tornado_app
+
+    ptb_updater_module.WebhookAppClass = webhook_app_with_health
+
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -505,6 +541,7 @@ def main():
     app.add_handler(CallbackQueryHandler(panel_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_input))
     app.add_handler(ChatMemberHandler(on_chat_member, ChatMemberHandler.CHAT_MEMBER))
+    install_health_endpoint()
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
